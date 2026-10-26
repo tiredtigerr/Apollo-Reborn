@@ -1746,8 +1746,11 @@ static BOOL ApolloGalleryTileAutoplayEnabledForKind(ApolloGalleryMediaKind kind)
                                                                   target:self
                                                                   action:@selector(apollo_slideshowPressed)];
     self.slideshowBarButtonItem.accessibilityLabel = @"Start Slideshow";
-    [buttons addObject:self.slideshowBarButtonItem];
     self.navigationItem.rightBarButtonItems = buttons;
+    // Beside the back button rather than with Sort and Filter: the title is
+    // centred, so a third button on the right squeezed "Gallery" down to "…".
+    self.navigationItem.leftItemsSupplementBackButton = YES;
+    self.navigationItem.leftBarButtonItems = @[ self.slideshowBarButtonItem ];
     [self apollo_updateSlideshowButton];
 }
 
