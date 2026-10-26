@@ -133,6 +133,8 @@ static void ApolloGalleryViewerActivateAudioSession(void) {
 - (void)replaceVideoURL:(nullable NSURL *)videoURL andPlay:(BOOL)play;
 // Rewinds the page's GIF to its first frame, so a slideshow sees a whole loop.
 - (void)restartAnimationFromFirstFrame;
+// Back to the first frame of a clip that stopped at its end instead of looping.
+- (void)rewindFinishedPlayback;
 @end
 
 @implementation ApolloGalleryViewerCell
@@ -224,15 +226,18 @@ static void ApolloGalleryViewerActivateAudioSession(void) {
     _animationLoopsCompleted = 0;
 }
 
+- (void)rewindFinishedPlayback {
+    if (!_playbackReachedEnd) return;
+    _playbackReachedEnd = NO;
+    [self.player seekToTime:kCMTimeZero];
+}
+
 - (void)setLoopsPlayback:(BOOL)loopsPlayback {
     _loopsPlayback = loopsPlayback;
     // A clip the slideshow let finish goes back to looping once the slideshow
     // stops. Rewind only: the viewer's playback sync decides which page
     // actually plays, so a neighbouring page can't start making noise here.
-    if (loopsPlayback && _playbackReachedEnd) {
-        _playbackReachedEnd = NO;
-        [self.player seekToTime:kCMTimeZero];
-    }
+    if (loopsPlayback) [self rewindFinishedPlayback];
 }
 
 // The one place a page's picture changes. `animation` non-nil streams a GIF;
@@ -1230,6 +1235,12 @@ static UIButton *ApolloGalleryChromeButton(Class buttonClass, UIImage *symbol, N
     // A neighbouring page's GIF has been animating off-screen; rewind it so
     // the loop the slideshow waits for is a whole one.
     if (kind == ApolloGallerySlideKindAnimation) [cell restartAnimationFromFirstFrame];
+    // A clip swiped back to after the slideshow let it finish is still parked
+    // on its last frame. Play it again; the model ignores that old end.
+    if (kind == ApolloGallerySlideKindPlayable && cell.playbackReachedEnd) {
+        [cell rewindFinishedPlayback];
+        [cell playIfPossible];
+    }
     NSInteger photoSeconds = ApolloGallerySlideshowSanitizedPhotoSeconds(sGallerySlideshowPhotoDuration);
     [self.slideshow beginSlideOfKind:kind photoSeconds:photoSeconds atTime:CACurrentMediaTime()];
     ApolloLog(@"[Gallery] slideshow slide %ld (%@)", (long)self.currentIndex,
@@ -1250,10 +1261,12 @@ static UIButton *ApolloGalleryChromeButton(Class buttonClass, UIImage *symbol, N
 }
 
 // Anything that means the user is doing something with this page, or can't
-// see it. While it holds, nothing advances.
+// see it. While it holds, nothing advances. A plain tap (the pager's
+// isTracking) deliberately isn't one: showing or hiding the controls leaves
+// the slideshow running untouched.
 - (BOOL)apollo_slideshowIsHeld {
     UIGestureRecognizerState dismissState = self.dismissPan.state;
-    return self.collectionView.isTracking || self.collectionView.isDragging || self.collectionView.isDecelerating ||
+    return self.collectionView.isDragging || self.collectionView.isDecelerating ||
            dismissState == UIGestureRecognizerStateBegan || dismissState == UIGestureRecognizerStateChanged ||
            self.isDismissing ||
            [self apollo_currentCell].isZoomed ||
