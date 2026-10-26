@@ -3678,6 +3678,7 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
                                     UDKeyFeedGalleryEdgeSwipeNav: @NO,
                                     UDKeyGalleryAutoplayVideos: @YES,
                                     UDKeyGalleryAutoplayGIFs: @YES,
+                                    UDKeyGallerySlideshowPhotoDuration: @5,
                                     UDKeyForwardSwipeForgetAfterScrolling: @NO,
                                     UDKeySwipeUpForComments: @NO,
                                     UDKeySportsClipsInlineVideo: @YES,
@@ -3848,6 +3849,7 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
     sFeedGalleryEdgeSwipeNav = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyFeedGalleryEdgeSwipeNav];
     sGalleryAutoplayVideos = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyGalleryAutoplayVideos];
     sGalleryAutoplayGIFs = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyGalleryAutoplayGIFs];
+    sGallerySlideshowPhotoDuration = [[NSUserDefaults standardUserDefaults] integerForKey:UDKeyGallerySlideshowPhotoDuration];
     sForwardSwipeForgetAfterScrolling = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyForwardSwipeForgetAfterScrolling];
     sSwipeUpForComments = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeySwipeUpForComments];
     sDevvitInteractivePosts = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyDevvitInteractivePosts];
