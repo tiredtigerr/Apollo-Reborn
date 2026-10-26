@@ -47,7 +47,9 @@ NSString *ApolloGallerySlideshowAdvanceName(ApolloGallerySlideshowAdvance reason
 @property (nonatomic) NSUInteger loopsSeen;
 @property (nonatomic) BOOL loopClean;
 
-// Playable.
+// Playable. An end only counts once this slide has seen the clip not at its
+// end: a page swiped back to can still be sitting on its previous end.
+@property (nonatomic) BOOL playbackSeenRunning;
 @property (nonatomic) NSTimeInterval failedSince;
 @property (nonatomic) double lastPosition;
 @property (nonatomic) NSTimeInterval lastProgressAt;
@@ -68,6 +70,7 @@ NSString *ApolloGallerySlideshowAdvanceName(ApolloGallerySlideshowAdvance reason
     // that is about to play is a complete one.
     self.loopsSeen = 0;
     self.loopClean = YES;
+    self.playbackSeenRunning = NO;
     self.failedSince = NAN;
     self.lastPosition = NAN;
     self.lastProgressAt = now;
@@ -148,7 +151,11 @@ NSString *ApolloGallerySlideshowAdvanceName(ApolloGallerySlideshowAdvance reason
 }
 
 - (ApolloGallerySlideshowAdvance)apollo_playableTickAtTime:(NSTimeInterval)now sample:(ApolloGallerySlideSample)sample {
-    if (sample.playbackEnded) return ApolloGallerySlideshowAdvancePlaybackEnded;
+    if (!sample.playbackEnded) {
+        self.playbackSeenRunning = YES;
+    } else if (self.playbackSeenRunning) {
+        return ApolloGallerySlideshowAdvancePlaybackEnded;
+    }
 
     if (sample.mediaFailed) {
         if (isnan(self.failedSince)) self.failedSince = now;

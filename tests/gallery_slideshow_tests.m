@@ -205,13 +205,35 @@ static void TestPlayableAdvancesWhenPlaybackEnds(void) {
 
 static void TestPlayableEndedDuringHoldAdvancesAfterHold(void) {
     ApolloGallerySlideshow *model = Begin(ApolloGallerySlideKindPlayable, 5, 0);
+    ApolloGallerySlideSample playing = S();
+    playing.playbackPosition = 8;
     ApolloGallerySlideSample ended = S();
     ended.playbackPosition = 9;
     ended.playbackEnded = YES;
     ApolloGallerySlideSample held = ended;
     held.held = YES;
+    Check(T(model, 0, playing) == None, @"video hold: playing");
     Check(T(model, 1, held) == None, @"video hold: ended while held");
     Check(T(model, 1.25, ended) == Ended, @"video hold: advances once the hold ends");
+}
+
+// Swiping back to a clip that already finished: its end belongs to the last
+// time it played, so it must play again rather than skip straight on.
+static void TestPlayableEndFromBeforeTheSlideDoesNotCount(void) {
+    ApolloGallerySlideshow *model = Begin(ApolloGallerySlideKindPlayable, 5, 0);
+    ApolloGallerySlideSample stale = S();
+    stale.playbackPosition = 9;
+    stale.playbackEnded = YES;
+    Check(T(model, 0, stale) == None, @"stale end: a clip still at its old end doesn't finish the slide");
+    ApolloGallerySlideSample replaying = S();
+    replaying.playbackPosition = 0;
+    Check(T(model, 0.25, replaying) == None, @"stale end: rewound and playing");
+    replaying.playbackPosition = 4;
+    Check(T(model, 4, replaying) == None, @"stale end: still playing");
+    ApolloGallerySlideSample ended = S();
+    ended.playbackPosition = 9;
+    ended.playbackEnded = YES;
+    Check(T(model, 9, ended) == Ended, @"stale end: the new end finishes the slide");
 }
 
 static void TestPlayableStallSkipsAfterTenSeconds(void) {
@@ -295,6 +317,7 @@ int main(void) {
         TestAnimationReadyTimeoutFallsBackToPhoto();
         TestPlayableAdvancesWhenPlaybackEnds();
         TestPlayableEndedDuringHoldAdvancesAfterHold();
+        TestPlayableEndFromBeforeTheSlideDoesNotCount();
         TestPlayableStallSkipsAfterTenSeconds();
         TestPlayableProgressResetsStall();
         TestPlayableWithoutPlayerStalls();
