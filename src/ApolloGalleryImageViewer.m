@@ -115,8 +115,22 @@ static void ApolloGalleryViewerActivateAudioSession(void) {
 // Raised while a zoom is active so the pager and the dismiss pan stay out of
 // the way (a zoomed page must pan its own content, not turn the page).
 @property (nonatomic, readonly) BOOL isZoomed;
+// Slideshow signals, read by the viewer on every slideshow tick (see
+// ApolloGallerySlideshow.h).
+// YES (the default) replays a clip from the top when it ends. A running
+// slideshow turns it off so that the end of the clip finishes the slide.
+@property (nonatomic) BOOL loopsPlayback;
+@property (nonatomic, readonly) BOOL playbackReachedEnd;
+// The full-size image load came back empty.
+@property (nonatomic, readonly) BOOL fullImageFailed;
+// An FLAnimatedImage is on the page.
+@property (nonatomic, readonly) BOOL showsAnimation;
+// Loops that animation has completed since it was last (re)set.
+@property (nonatomic, readonly) NSUInteger animationLoopsCompleted;
 - (void)configureWithItem:(ApolloGalleryItem *)item;
 - (void)replaceVideoURL:(nullable NSURL *)videoURL andPlay:(BOOL)play;
+// Rewinds the page's GIF to its first frame, so a slideshow sees a whole loop.
+- (void)restartAnimationFromFirstFrame;
 @end
 
 @implementation ApolloGalleryViewerCell
@@ -152,6 +166,21 @@ static void ApolloGalleryViewerActivateAudioSession(void) {
         _imageView.backgroundColor = UIColor.blackColor;
         [_mediaContainerView addSubview:_imageView];
 
+        _loopsPlayback = YES;
+        // Counts completed GIF loops for the slideshow, which waits for a full
+        // one. Installed once: FLAnimatedImageView keeps the block across
+        // animations and calls it on the main thread at every wrap (Apollo's
+        // displayDidRefresh: replacement in ApolloMedia.xm does the same).
+        if ([_imageView respondsToSelector:@selector(setLoopCompletionBlock:)]) {
+            __weak typeof(self) weakSelf = self;
+            void (^loopCompleted)(NSUInteger) = ^(NSUInteger loopCountRemaining) {
+                typeof(self) strongSelf = weakSelf;
+                if (strongSelf) strongSelf->_animationLoopsCompleted += 1;
+                (void)loopCountRemaining;
+            };
+            ((void (*)(id, SEL, id))objc_msgSend)(_imageView, @selector(setLoopCompletionBlock:), loopCompleted);
+        }
+
         _spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
         _spinner.color = UIColor.whiteColor;
         _spinner.hidesWhenStopped = YES;
@@ -173,11 +202,43 @@ static void ApolloGalleryViewerActivateAudioSession(void) {
     return self.player != nil;
 }
 
+- (id)apollo_currentAnimation {
+    if (![self.imageView respondsToSelector:@selector(animatedImage)]) return nil;
+    return ((id (*)(id, SEL))objc_msgSend)(self.imageView, @selector(animatedImage));
+}
+
+- (BOOL)showsAnimation {
+    return [self apollo_currentAnimation] != nil;
+}
+
+- (void)restartAnimationFromFirstFrame {
+    id animation = [self apollo_currentAnimation];
+    if (!animation) return;
+    // FLAnimatedImageView only resets its frame index, loop countdown and
+    // timing when the animated image actually changes, so clear it first.
+    // Both calls land before the next display pass, so nothing flickers.
+    ApolloGalleryPageSetAnimation(self.imageView, nil);
+    ApolloGalleryPageSetAnimation(self.imageView, animation);
+    _animationLoopsCompleted = 0;
+}
+
+- (void)setLoopsPlayback:(BOOL)loopsPlayback {
+    _loopsPlayback = loopsPlayback;
+    // A clip the slideshow let finish goes back to looping once the slideshow
+    // stops. Rewind only: the viewer's playback sync decides which page
+    // actually plays, so a neighbouring page can't start making noise here.
+    if (loopsPlayback && _playbackReachedEnd) {
+        _playbackReachedEnd = NO;
+        [self.player seekToTime:kCMTimeZero];
+    }
+}
+
 // The one place a page's picture changes. `animation` non-nil streams a GIF;
 // nil clears any previous one before showing the still.
 - (void)apollo_displayImage:(UIImage *)image animation:(id)animation {
     BOOL canAnimate = [self.imageView respondsToSelector:@selector(setAnimatedImage:)];
     ApolloGalleryPageSetAnimation(self.imageView, animation);
+    _animationLoopsCompleted = 0;
     // Without FLAnimatedImageView there is nothing to hand the animation to, so
     // show its poster frame rather than leaving the page blank.
     if (!animation || !canAnimate) self.imageView.image = image;
@@ -191,6 +252,7 @@ static void ApolloGalleryViewerActivateAudioSession(void) {
     [self teardownPlayer];
     [self apollo_displayImage:nil animation:nil];
     self.fullImageLoaded = NO;
+    _fullImageFailed = NO;
     self.zoomGeometrySize = CGSizeZero;
     self.zoomView.zoomScale = 1.0;
     self.zoomView.contentInset = UIEdgeInsetsZero;
@@ -267,6 +329,7 @@ static void ApolloGalleryViewerActivateAudioSession(void) {
     self.playerLayer = nil;
     self.player = nil;
     self.videoURL = nil;
+    _playbackReachedEnd = NO;
 }
 
 - (void)prepareVideo:(NSURL *)url {
@@ -283,8 +346,16 @@ static void ApolloGalleryViewerActivateAudioSession(void) {
                                                           object:player.currentItem
                                                            queue:[NSOperationQueue mainQueue]
                                                       usingBlock:^(NSNotification *note) {
-        [weakSelf.player seekToTime:kCMTimeZero];
-        [weakSelf.player play];
+        typeof(self) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        if (strongSelf.loopsPlayback) {
+            [strongSelf.player seekToTime:kCMTimeZero];
+            [strongSelf.player play];
+        } else {
+            // A running slideshow moves on instead. AVPlayer's default end
+            // action has already paused on the last frame.
+            strongSelf->_playbackReachedEnd = YES;
+        }
     }];
 
     AVPlayerLayer *layer = [AVPlayerLayer playerLayerWithPlayer:player];
@@ -320,6 +391,7 @@ static void ApolloGalleryViewerActivateAudioSession(void) {
 - (void)configureWithItem:(ApolloGalleryItem *)item {
     NSURL *url = item.imageURL;
     self.imageURL = url;
+    _fullImageFailed = NO;
     // Stash the stream URL only; playIfPossible builds the player when this
     // page actually becomes current.
     // A hosted post deliberately waits on its original MP4 instead of starting
@@ -359,6 +431,9 @@ static void ApolloGalleryViewerActivateAudioSession(void) {
             [strongSelf apollo_displayImage:decoded.image animation:decoded.animatedImage];
             strongSelf.fullImageLoaded = YES;
             [strongSelf apollo_resetZoomGeometry];
+        } else {
+            // The slideshow times a failed picture on whatever is showing.
+            strongSelf->_fullImageFailed = YES;
         }
         (void)data;
     }];
