@@ -761,6 +761,19 @@ static UIButton *ApolloGalleryChromeButton(Class buttonClass, UIImage *symbol, N
 // back while the viewer owns the change.
 @property (nonatomic) BOOL ownsIdleTimer;
 @property (nonatomic) BOOL savedIdleTimerDisabled;
+// Samples the current page into the model every ApolloGallerySlideshowTickInterval.
+@property (nonatomic, strong, nullable) NSTimer *slideshowTimer;
+// The crossfade has already moved to the next page. Ticks wait for it to land.
+@property (nonatomic) BOOL slideshowTransitionInFlight;
+// The current page's hosted clip lookup found nothing to play.
+@property (nonatomic) BOOL currentHostedLookupFailed;
+// Only for logging the held/resumed transitions.
+@property (nonatomic) BOOL slideshowWasHeld;
+// At the last loaded item: already logged the wait, and already asked for a
+// batch on this page. A load that fails after that ends the slideshow
+// instead of retrying every tick.
+@property (nonatomic) BOOL slideshowWaitingForBatch;
+@property (nonatomic) BOOL slideshowRequestedBatch;
 @end
 
 @implementation ApolloGalleryImageViewer
@@ -926,6 +939,7 @@ static UIButton *ApolloGalleryChromeButton(Class buttonClass, UIImage *symbol, N
                                                   object:nil];
     // Normally viewWillDisappear already stopped the slideshow; this covers a
     // viewer that goes away without being dismissed.
+    [_slideshowTimer invalidate];
     if (_ownsIdleTimer) UIApplication.sharedApplication.idleTimerDisabled = _savedIdleTimerDisabled;
 }
 
@@ -1166,6 +1180,15 @@ static UIButton *ApolloGalleryChromeButton(Class buttonClass, UIImage *symbol, N
     self.currentVideoPausedByUser = NO;
     [self apollo_syncPlayback];
     [self apollo_slideshowBeginCurrentSlide];
+    self.slideshowWasHeld = NO;
+    __weak typeof(self) weakSelf = self;
+    self.slideshowTimer = [NSTimer scheduledTimerWithTimeInterval:ApolloGallerySlideshowTickInterval
+                                                          repeats:YES
+                                                            block:^(NSTimer *timer) {
+        [weakSelf apollo_slideshowTick];
+        (void)timer;
+    }];
+    self.slideshowTimer.tolerance = 0.05;
     [self apollo_updateSlideshowButton];
     [self apollo_updateIdleTimer];
     ApolloLog(@"[Gallery] slideshow started at %ld", (long)self.currentIndex);
@@ -1174,6 +1197,8 @@ static UIButton *ApolloGalleryChromeButton(Class buttonClass, UIImage *symbol, N
 - (void)apollo_stopSlideshowWithReason:(NSString *)reason showChrome:(BOOL)showChrome {
     if (!self.slideshowRunning) return;
     self.slideshowRunning = NO;
+    [self.slideshowTimer invalidate];
+    self.slideshowTimer = nil;
     // Back to looping. A clip the slideshow let finish is rewound by this,
     // and the sync below plays the current one again like any page.
     for (UICollectionViewCell *cell in self.collectionView.visibleCells) {
@@ -1211,6 +1236,107 @@ static UIButton *ApolloGalleryChromeButton(Class buttonClass, UIImage *symbol, N
               kind == ApolloGallerySlideKindPlayable ? @"playable"
               : kind == ApolloGallerySlideKindAnimation ? @"animation"
               : [NSString stringWithFormat:@"photo %lds", (long)photoSeconds]);
+}
+
+- (void)apollo_slideshowTick {
+    if (!self.slideshowRunning || self.slideshowTransitionInFlight) return;
+    ApolloGallerySlideSample sample = [self apollo_slideshowSample];
+    if (sample.held != self.slideshowWasHeld) {
+        self.slideshowWasHeld = sample.held;
+        ApolloLog(@"[Gallery] slideshow %@ at %ld", sample.held ? @"held" : @"resumed", (long)self.currentIndex);
+    }
+    ApolloGallerySlideshowAdvance reason = [self.slideshow tickAtTime:CACurrentMediaTime() sample:sample];
+    if (reason != ApolloGallerySlideshowAdvanceNone) [self apollo_slideshowAdvanceForReason:reason];
+}
+
+// Anything that means the user is doing something with this page, or can't
+// see it. While it holds, nothing advances.
+- (BOOL)apollo_slideshowIsHeld {
+    UIGestureRecognizerState dismissState = self.dismissPan.state;
+    return self.collectionView.isTracking || self.collectionView.isDragging || self.collectionView.isDecelerating ||
+           dismissState == UIGestureRecognizerStateBegan || dismissState == UIGestureRecognizerStateChanged ||
+           self.isDismissing ||
+           [self apollo_currentCell].isZoomed ||
+           self.mediaMenuSession != nil ||
+           self.presentedViewController != nil ||
+           ([self.shareButton isKindOfClass:[ApolloGalleryMenuButton class]] &&
+            ((ApolloGalleryMenuButton *)self.shareButton).menuVisible) ||
+           self.videoScrubbing || self.gestureScrubArmed || self.gestureScrubActive ||
+           !self.appActive ||
+           self.currentVideoPausedByUser;
+}
+
+- (ApolloGallerySlideSample)apollo_slideshowSample {
+    ApolloGalleryViewerCell *cell = [self apollo_currentCell];
+    ApolloGallerySlideSample sample;
+    memset(&sample, 0, sizeof(sample));
+    sample.held = [self apollo_slideshowIsHeld];
+    sample.fullImageShown = cell.fullImageLoaded;
+    sample.animationShown = cell.showsAnimation;
+    sample.animationLoops = cell.animationLoopsCompleted;
+    // A clip's poster failing doesn't stop the clip; only its lookup can.
+    sample.mediaFailed = self.slideshow.kind == ApolloGallerySlideKindPlayable
+        ? self.currentHostedLookupFailed : cell.fullImageFailed;
+    sample.playbackEnded = cell.playbackReachedEnd;
+    double position = cell.player ? CMTimeGetSeconds(cell.player.currentTime) : NAN;
+    sample.playbackPosition = isfinite(position) ? position : NAN;
+    return sample;
+}
+
+- (void)apollo_slideshowAdvanceForReason:(ApolloGallerySlideshowAdvance)reason {
+    NSInteger next = self.currentIndex + 1;
+    if (next < (NSInteger)self.feed.items.count) {
+        ApolloLog(@"[Gallery] slideshow advance %ld -> %ld (%@)", (long)self.currentIndex, (long)next,
+                  ApolloGallerySlideshowAdvanceName(reason));
+        [self apollo_slideshowCrossfadeToIndex:next];
+        return;
+    }
+    // At the last loaded item. Endless like the feed: wait for the batch the
+    // load-ahead already asked for, or ask for one, until Reddit runs out.
+    if (self.feed.isLoading) {
+        if (!self.slideshowWaitingForBatch) {
+            self.slideshowWaitingForBatch = YES;
+            ApolloLog(@"[Gallery] slideshow waiting for next batch at %ld", (long)self.currentIndex);
+        }
+        return;
+    }
+    if (self.feed.isExhausted) {
+        [self apollo_stopSlideshowWithReason:@"end of feed" showChrome:YES];
+        [self apollo_showToast:@"End of slideshow"];
+        return;
+    }
+    if (self.feed.lastErrorMessage.length > 0 && self.slideshowRequestedBatch) {
+        // That load's completion has already said "Couldn't load more".
+        [self apollo_stopSlideshowWithReason:@"load failed" showChrome:YES];
+        return;
+    }
+    self.slideshowRequestedBatch = YES;
+    [self apollo_loadMoreIfNeeded];
+}
+
+// The page change still goes through -scrollViewDidScroll: like a swipe
+// (counter, card, prefetch, load-ahead). The fade is a snapshot transition
+// over the pager, so the outgoing picture dissolves into the incoming one.
+- (void)apollo_slideshowCrossfadeToIndex:(NSInteger)index {
+    CGFloat width = MAX(self.collectionView.bounds.size.width, 1.0);
+    self.slideshowTransitionInFlight = YES;
+    __weak typeof(self) weakSelf = self;
+    [UIView transitionWithView:self.collectionView
+                      duration:ApolloGallerySlideshowCrossfadeDuration
+                       options:UIViewAnimationOptionTransitionCrossDissolve | UIViewAnimationOptionAllowUserInteraction
+                    animations:^{
+        typeof(self) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        [strongSelf.collectionView setContentOffset:CGPointMake(width * index, 0.0) animated:NO];
+        // The new page's cell only exists after layout. Start its playback
+        // and its slide here, so a clip begins as it fades in.
+        [strongSelf.collectionView layoutIfNeeded];
+        [strongSelf apollo_syncPlayback];
+        [strongSelf apollo_slideshowBeginCurrentSlide];
+    } completion:^(BOOL finished) {
+        weakSelf.slideshowTransitionInFlight = NO;
+        (void)finished;
+    }];
 }
 
 // The screen stays awake while a slideshow runs in the foreground, and goes
@@ -1646,6 +1772,8 @@ static NSString *ApolloGalleryTimeString(NSTimeInterval seconds) {
         }
         [[self apollo_currentCell] playIfPossible];
     }
+    // A clip the user paused holds a running slideshow until they play it again.
+    self.currentVideoPausedByUser = (player.rate == 0.0f);
     [self apollo_refreshVideoBarNow];
 }
 
@@ -1834,6 +1962,11 @@ static NSString *ApolloGalleryTimeString(NSTimeInterval seconds) {
     page = MAX(0, MIN(page, (NSInteger)self.feed.items.count - 1));
     if (page == self.currentIndex) return;
     self.currentIndex = page;
+    // Per-page slideshow state starts over with the new page.
+    self.currentVideoPausedByUser = NO;
+    self.currentHostedLookupFailed = NO;
+    self.slideshowWaitingForBatch = NO;
+    self.slideshowRequestedBatch = NO;
     // A different post carries different details, so it starts with its card
     // showing even if the last one's was dismissed.
     self.infoPanelHiddenForItem = NO;
@@ -1846,6 +1979,9 @@ static NSString *ApolloGalleryTimeString(NSTimeInterval seconds) {
     [self apollo_syncPlayback];
     [self apollo_prefetchAroundIndex:page];
     [self apollo_loadMoreIfNeeded];
+    // A swipe during a slideshow carries on from the page it lands on. A
+    // slideshow advance starts its own slide once the new cell is laid out.
+    if (self.slideshowRunning && !self.slideshowTransitionInFlight) [self apollo_slideshowBeginCurrentSlide];
 }
 
 // Exactly one page plays at a time: every other visible cell (the neighbours a
@@ -1872,6 +2008,8 @@ static NSString *ApolloGalleryTimeString(NSTimeInterval seconds) {
             [strongSelf apollo_bindVideoBarToPlayer:currentCell.player];
             if (!resolvedOriginal && !currentItem.videoURL) {
                 [strongSelf apollo_showToast:@"Couldn't load video"];
+                // A slideshow shows the poster for the photo duration, then moves on.
+                strongSelf.currentHostedLookupFailed = YES;
             }
         }];
     }
@@ -1943,7 +2081,11 @@ static NSString *ApolloGalleryTimeString(NSTimeInterval seconds) {
             return;
         }
         if (addedRange.length == 0) {
-            if (strongSelf.feed.isExhausted) [strongSelf apollo_showToast:@"That's everything"];
+            // A slideshow says "End of slideshow" when it actually gets there,
+            // a few pictures after this load-ahead runs dry.
+            if (strongSelf.feed.isExhausted && !strongSelf.slideshowRunning) {
+                [strongSelf apollo_showToast:@"That's everything"];
+            }
             return;
         }
         [strongSelf feedDidAppendItems];
