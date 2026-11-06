@@ -157,6 +157,9 @@ static NSString *const UDKeyEnableFlairColors = @"EnableFlairColors";
 static NSString *const UDKeyBoldPostTitles = @"BoldPostTitles";
 static NSString *const ApolloFlairColorsChangedNotification = @"ApolloFlairColorsChangedNotification";
 static NSString *const UDKeyReadPostMaxCount = @"ReadPostMaxCount";
+// Hidden & Deleted's Posts tab: YES = compact posts, NO = large thumbnails.
+// Unset follows the feeds' own UseCompactThumbnails.
+static NSString *const UDKeyHiddenContentCompactPosts = @"HiddenContentCompactPosts";
 static NSString *const UDKeyPreferredGIFFallbackFormat = @"PreferredGIFFallbackFormat";
 static NSString *const UDKeyUnmuteCommentsVideos = @"UnmuteCommentsVideos";
 // "Unmute Videos in Feed": how feed videos behave when they autoplay while
@@ -364,6 +367,10 @@ static NSString *const UDKeyDuoLandscapeFeedLayout = @"DuoLandscapeFeedLayout";
 // Open Duo subreddit panel appearance: NO = Standard
 // (default), YES = Liquid Glass. The panel keeps the same size and navigation.
 static NSString *const UDKeyDuoSubredditPanelGlassEnabled = @"DuoSubredditPanelGlassEnabled";
+// Subreddit quick-switcher (feed title tap, Posts tab long press): YES = the
+// tweak's Modern search sheet (default on Duo), NO = Apollo's Classic inline popup
+// (default elsewhere; it doesn't carry over a Duo unfold).
+static NSString *const UDKeySubredditSwitcherSheetEnabled = @"SubredditSwitcherSheetEnabled";
 // iPad only. When ON, replaces each tab's single navigation stack with a
 // multi-column UISplitViewController: sidebar (the tab's own root list) →
 // content → detail. Opt-in; default OFF via registerDefaults. Installation
@@ -413,6 +420,9 @@ static NSString *const UDKeyInfoRowOverlayMode = @"InfoRowOverlayMode";   // %/t
 static NSString *const UDKeyInfoRowTapTranslation = @"InfoRowTapTranslation";
 static NSString *const UDKeyThreeStateVoting = @"ThreeStateVoting";
 static NSString *const UDKeyLiveCommentsFollow = @"LiveCommentsFollow";
+// Existing floating comment jump button: 0 = native parent threads (default),
+// 1 = comments added since the previous visit. Shared by General and More.
+static NSString *const UDKeyCommentNavigationMode = @"CommentNavigationMode";
 // Per-POST comment sort memory (issue #555). When ON, changing a post's comment sort
 // is remembered for that post (capped LRU mapping below) and restored when its
 // comments are reopened; every other post keeps Apollo's native chain (suggested
@@ -745,7 +755,7 @@ static NSString *const UDKeyUpdateSkippedVersion = @"UpdateSkippedVersion"; // "
 // Feed thumbnails for text posts with embedded images (off = native behavior).
 static NSString *const UDKeyFeedTextPostThumbnails = @"FeedTextPostThumbnails";
 // Restores the last feed, open post and reading position after process eviction.
-// Default YES. Turning it off deletes any saved or pending reading session.
+// Default NO. Turning it off deletes any saved or pending reading session.
 static NSString *const UDKeyRestoreReadingSession = @"RestoreReadingSession";
 // Replaces Apollo's fixed two/three-tile Reddit-gallery mosaic in large feed
 // cards with a horizontally paging image carousel. Default YES. See
@@ -859,6 +869,13 @@ static NSString *const UDKeyActionMenuLayouts = @"ActionMenuLayouts";
 static NSString *const UDKeyActionMenuLastPresented = @"ActionMenuLastPresented";
 // Posted (object = the context id) whenever a menu's order or hidden set changes.
 static NSString *const ApolloActionMenuLayoutsChangedNotification = @"ApolloActionMenuLayoutsChangedNotification";
+
+// All+ r/all: blend NSFW posts into r/all the way old Reddit's r/all showed
+// them (see ApolloAllPlusNSFW.xm / ApolloAllPlusMerge.m). Opt-in, default OFF.
+static NSString *const UDKeyAllPlusNSFWEnabled = @"AllPlusNSFWEnabled";
+// User boost added to candidate hot-rank on the r/all merge.
+// double in [0.0, 2.0]; 0.0 = pure hot-merge. Set from the settings slider.
+static NSString *const UDKeyAllPlusNSFWBoost = @"AllPlusNSFWBoost";
 
 // The last TWEAK_VERSION (without the leading "v") the What's New sheet was
 // shown for (or silently advanced past, when a version has no catalog entry).

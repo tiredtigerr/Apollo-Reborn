@@ -26,6 +26,7 @@
 #import "ApolloUserProfileCache.h"
 #import "ApolloSubredditInfoCache.h"
 #import "ApolloSubredditCustomIconCache.h"
+#import "ApolloWebJSON.h"
 #import "ApolloWebSessionStore.h"
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
@@ -2464,8 +2465,8 @@ static const NSInteger kMaxChatFilterPages = 8;   // cap so a chat-sparse accoun
 // a list back. On an error it logs "Error fetching messages" and returns; on a nil list (what
 // RedditKit makes of a 403 HTML block page) it does nothing. Either way the Inbox sat on its
 // spinner for good, which is what API-Key-Free accounts hit once www.reddit.com started refusing
-// /api/info (ApolloWebJSON now sends those reads to /api/info/.json), and what a 429 or a dropped
-// connection on that one lookup still caused. An empty list takes the stock path and the rows
+// /api/info (ApolloWebJSON now sends those reads by other routes, ApolloWebJSONRoutes.m), and
+// what a 429 or a dropped connection on that one lookup still caused. An empty list takes the stock path and the rows
 // draw without their parent context, so while Apollo handles a page of messages, a failed parent
 // lookup answers with an empty list. Only the Inbox calls -thingsByFullNames: from inside a
 // -messagesInCategory: completion (Hopper: the other nine thingsByFullNames call sites are in
@@ -2488,6 +2489,87 @@ static id ApolloInboxCompletionMarkingParentLookup(id completion) {
             if (outermost) [threadDictionary removeObjectForKey:kApolloInboxPageHandlingKey];
         }
     } copy];
+}
+
+// Reused reply parents (issue #1573). Apollo refreshes the Inbox every 90 s while the app is open,
+// on screen or not, and every refresh repeats the parent lookup for the same replies. A parent's
+// title and subreddit don't change, but on an API-Key-Free (cookie) session each lookup spends one
+// of the few requests Reddit allows a minute: about 7 every 10 minutes while the inbox sits still.
+// So for those accounts the last answer for the same set of parents is handed back for up to 10
+// minutes, until the account writes anything (an edited or deleted comment can be a parent; the
+// same write count ApolloWebJSON's shared reads start over on). A new reply (a new set) still asks
+// Reddit. OAuth accounts have Reddit's full API budget and keep the stock lookup.
+static const NSTimeInterval kApolloInboxParentsReuseTTL = 10.0 * 60.0;
+static const NSUInteger kApolloInboxParentsReuseMaxEntries = 8;
+static NSMutableDictionary<NSString *, NSArray *> *sApolloInboxParentsByKey;
+static NSMutableDictionary<NSString *, NSDate *> *sApolloInboxParentsAnsweredAt;
+static NSMutableDictionary<NSString *, NSNumber *> *sApolloInboxParentsWriteCount;
+
+static NSObject *ApolloInboxParentsLock(void) {
+    static NSObject *lock;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ lock = [NSObject new]; });
+    return lock;
+}
+
+// The client's account username when it is an API-Key-Free account, else nil.
+static NSString *ApolloInboxParentsKeylessUsername(id client) {
+    id user = [client respondsToSelector:@selector(currentUser)]
+        ? ((id (*)(id, SEL))objc_msgSend)(client, @selector(currentUser)) : nil;
+    NSString *username = [user respondsToSelector:@selector(username)]
+        ? ((id (*)(id, SEL))objc_msgSend)(user, @selector(username)) : nil;
+    if (![username isKindOfClass:[NSString class]] || username.length == 0) return nil;
+    return ApolloWebSessionFor(username) ? username.lowercaseString : nil;
+}
+
+// "<user>|<sorted fullnames>" for an API-Key-Free client's lookup, else nil. Apollo builds the
+// list from a Set, so its order changes from one refresh to the next.
+static NSString *ApolloInboxParentsReuseKey(id client, id fullNames) {
+    if (![fullNames isKindOfClass:[NSArray class]] || [(NSArray *)fullNames count] == 0) return nil;
+    NSString *username = ApolloInboxParentsKeylessUsername(client);
+    if (!username) return nil;
+    for (id name in (NSArray *)fullNames) {
+        if (![name isKindOfClass:[NSString class]]) return nil;
+    }
+    NSArray *sorted = [(NSArray *)fullNames sortedArrayUsingSelector:@selector(compare:)];
+    return [NSString stringWithFormat:@"%@|%@", username, [sorted componentsJoinedByString:@","]];
+}
+
+static NSString *ApolloInboxParentsKeyUsername(NSString *key) {
+    return [key componentsSeparatedByString:@"|"].firstObject;
+}
+
+static NSArray *ApolloInboxParentsReusable(NSString *key, NSTimeInterval *outAge) {
+    if (!key) return nil;
+    NSUInteger writes = ApolloWebJSONAccountWriteCount(ApolloInboxParentsKeyUsername(key));
+    @synchronized (ApolloInboxParentsLock()) {
+        NSDate *answeredAt = sApolloInboxParentsAnsweredAt[key];
+        NSTimeInterval age = answeredAt ? -answeredAt.timeIntervalSinceNow : DBL_MAX;
+        if (age > kApolloInboxParentsReuseTTL) return nil;
+        if (sApolloInboxParentsWriteCount[key].unsignedIntegerValue != writes) return nil;
+        if (outAge) *outAge = age;
+        return sApolloInboxParentsByKey[key];
+    }
+}
+
+// `writesAtSend` is the account's write count when the lookup went out. An answer that raced a
+// write may predate it, and keeping it under that older count means it's never reused.
+static void ApolloInboxParentsRemember(NSString *key, NSArray *things, NSUInteger writesAtSend) {
+    if (!key || things.count == 0) return;
+    @synchronized (ApolloInboxParentsLock()) {
+        if (!sApolloInboxParentsByKey) sApolloInboxParentsByKey = [NSMutableDictionary dictionary];
+        if (!sApolloInboxParentsAnsweredAt) sApolloInboxParentsAnsweredAt = [NSMutableDictionary dictionary];
+        if (!sApolloInboxParentsWriteCount) sApolloInboxParentsWriteCount = [NSMutableDictionary dictionary];
+        sApolloInboxParentsByKey[key] = [things copy];
+        sApolloInboxParentsAnsweredAt[key] = [NSDate date];
+        sApolloInboxParentsWriteCount[key] = @(writesAtSend);
+        while (sApolloInboxParentsAnsweredAt.count > kApolloInboxParentsReuseMaxEntries) {
+            NSString *oldest = [sApolloInboxParentsAnsweredAt keysSortedByValueUsingSelector:@selector(compare:)].firstObject;
+            [sApolloInboxParentsAnsweredAt removeObjectForKey:oldest];
+            [sApolloInboxParentsByKey removeObjectForKey:oldest];
+            [sApolloInboxParentsWriteCount removeObjectForKey:oldest];
+        }
+    }
 }
 
 %hook RDKClient
@@ -2561,13 +2643,27 @@ static id ApolloInboxCompletionMarkingParentLookup(id completion) {
 }
 
 // The Inbox's reply-parent lookup (Inbox reply parents, above): a failure answers with an empty
-// list so the page still draws. Any other caller passes straight through.
+// list so the page still draws, and an API-Key-Free account reuses a recent answer for the same
+// parents (Reused reply parents, above). Any other caller passes straight through.
 - (id)thingsByFullNames:(id)fullNames completion:(id)completion {
     if (!completion || ![[NSThread currentThread].threadDictionary[kApolloInboxPageHandlingKey] boolValue]) return %orig;
     void (^lookupCompletion)(NSArray *, NSError *) = completion;
     NSUInteger requested = [fullNames isKindOfClass:[NSArray class]] ? [(NSArray *)fullNames count] : 0;
+    NSString *reuseKey = ApolloInboxParentsReuseKey(self, fullNames);
+    NSTimeInterval reusedAge = 0;
+    NSArray *reused = ApolloInboxParentsReusable(reuseKey, &reusedAge);
+    NSUInteger writesAtSend = reuseKey ? ApolloWebJSONAccountWriteCount(ApolloInboxParentsKeyUsername(reuseKey)) : 0;
+    if (reused) {
+        ApolloLog(@"[InboxParents] Reused the %.0fs-old lookup of %lu reply parent(s) instead of asking Reddit again",
+                  reusedAge, (unsigned long)requested);
+        // Apollo ignores the returned task (sub_10019dde8), and it expects the answer after this
+        // call returns, like the network answer.
+        dispatch_async(dispatch_get_main_queue(), ^{ lookupCompletion(reused, nil); });
+        return nil;
+    }
     id wrapped = ^(NSArray *things, NSError *error) {
         if (!error && [things isKindOfClass:[NSArray class]]) {
+            ApolloInboxParentsRemember(reuseKey, things, writesAtSend);
             lookupCompletion(things, nil);
             return;
         }

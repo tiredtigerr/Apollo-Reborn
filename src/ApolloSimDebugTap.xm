@@ -622,6 +622,122 @@ static id ApolloSimDebugProbeObject(id object, const char *selectorName) {
     return ((id (*)(id, SEL))objc_msgSend)(object, selector);
 }
 
+// "titleprobe": every visible navigation-bar title control, its labels and the
+// horizontal constraints sizing it, for diagnosing squeezed titles.
+static void ApolloSimDebugCollectTitleControls(UIView *view, NSMutableArray<UIView *> *out) {
+    if ([NSStringFromClass(view.class) isEqualToString:@"_UINavigationBarTitleControl"]) [out addObject:view];
+    for (UIView *subview in view.subviews) ApolloSimDebugCollectTitleControls(subview, out);
+}
+
+static void ApolloSimDebugTitleProbe(void) {
+    NSMutableArray<UIView *> *controls = [NSMutableArray array];
+    for (UIWindow *window in ApolloAllWindows()) ApolloSimDebugCollectTitleControls(window, controls);
+    for (UIView *control in controls) {
+        ApolloLog(@"[TitleProbe] %p frame=%@ alpha=%.2f hidden=%d intrinsic=%@ super=%@ transform=%@",
+                  control, NSStringFromCGRect(control.frame), control.alpha, control.hidden,
+                  NSStringFromCGSize(control.intrinsicContentSize), NSStringFromClass(control.superview.class),
+                  NSStringFromCGAffineTransform(control.transform));
+        NSMutableArray<UIView *> *queue = [NSMutableArray arrayWithObject:control];
+        for (NSUInteger i = 0; i < queue.count; i++) {
+            UIView *view = queue[i];
+            if ([view isKindOfClass:UILabel.class]) {
+                UILabel *label = (UILabel *)view;
+                ApolloLog(@"[TitleProbe]   label '%@' frame=%@ intrinsic=%@", label.text,
+                          NSStringFromCGRect(label.frame), NSStringFromCGSize(label.intrinsicContentSize));
+            } else if (view != control) {
+                ApolloLog(@"[TitleProbe]   %@ frame=%@", NSStringFromClass(view.class), NSStringFromCGRect(view.frame));
+            }
+            [queue addObjectsFromArray:view.subviews];
+        }
+        for (NSLayoutConstraint *constraint in [control constraintsAffectingLayoutForAxis:UILayoutConstraintAxisHorizontal]) {
+            ApolloLog(@"[TitleProbe]   constraint %@", constraint);
+        }
+    }
+}
+
+// "constraintprobe <Class>": the constraints owned by the first visible view of
+// that class and by each of its direct subviews.
+static UIView *ApolloSimDebugFindViewOfClass(UIView *view, Class cls) {
+    if ([view isKindOfClass:cls] && !view.hidden && view.window) return view;
+    for (UIView *subview in view.subviews) {
+        UIView *found = ApolloSimDebugFindViewOfClass(subview, cls);
+        if (found) return found;
+    }
+    return nil;
+}
+
+static void ApolloSimDebugConstraintProbe(NSString *className) {
+    Class cls = objc_getClass(className.UTF8String);
+    UIView *view = nil;
+    for (UIWindow *window in ApolloAllWindows()) {
+        view = cls ? ApolloSimDebugFindViewOfClass(window, cls) : nil;
+        if (view) break;
+    }
+    if (!view) { ApolloLog(@"[ConstraintProbe] no visible %@", className); return; }
+    ApolloLog(@"[ConstraintProbe] %@ %p frame=%@ safe=%@", className, view, NSStringFromCGRect(view.frame),
+              NSStringFromUIEdgeInsets(view.safeAreaInsets));
+    NSMutableArray<UIView *> *owners = [NSMutableArray arrayWithObject:view];
+    [owners addObjectsFromArray:view.subviews];
+    for (UIView *owner in owners) {
+        for (NSLayoutConstraint *constraint in owner.constraints) {
+            ApolloLog(@"[ConstraintProbe]   %@ owns %@", NSStringFromClass(owner.class), constraint);
+        }
+    }
+}
+
+// "focusprobe": the item UIKit's focus system currently has focused in each
+// window, with its frame and ancestry.
+static void ApolloSimDebugFocusProbe(void) {
+    for (UIWindow *window in ApolloAllWindows()) {
+        UIFocusSystem *system = [UIFocusSystem focusSystemForEnvironment:window];
+        id<UIFocusItem> item = system.focusedItem;
+        if (!item) { ApolloLog(@"[FocusProbe] %@: nothing focused", NSStringFromClass(window.class)); continue; }
+        NSMutableString *chain = [NSMutableString string];
+        if ([(id)item isKindOfClass:UIView.class]) {
+            for (UIView *view = (UIView *)item; view && view != window; view = view.superview) {
+                [chain appendFormat:@" < %@", NSStringFromClass(view.class)];
+                if (chain.length > 300) break;
+            }
+        }
+        CGRect frame = [item.focusItemContainer.coordinateSpace convertRect:item.frame toCoordinateSpace:window];
+        ApolloLog(@"[FocusProbe] %@ focused=%@ frame=%@ effect=%@%@", NSStringFromClass(window.class),
+                  NSStringFromClass([(id)item class]), NSStringFromCGRect(frame),
+                  [(id)item respondsToSelector:@selector(focusEffect)] ? item.focusEffect : nil, chain);
+    }
+}
+
+// "responderprobe": each window's first responder (found through UIKit's
+// private -firstResponder, which also reports view controllers) and, for a
+// message thread on screen, whether its reply bar is in a window.
+static void ApolloSimDebugResponderProbe(void) {
+    SEL firstResponder = NSSelectorFromString(@"firstResponder");
+    for (UIWindow *window in ApolloAllWindows()) {
+        id responder = [window respondsToSelector:firstResponder]
+            ? ((id (*)(id, SEL))objc_msgSend)(window, firstResponder) : nil;
+        ApolloLog(@"[ResponderProbe] %@ key=%d firstResponder=%@ %p", NSStringFromClass(window.class),
+                  window.isKeyWindow, NSStringFromClass([responder class]), responder);
+    }
+    Class threadClass = objc_getClass("_TtC6Apollo22MessagesViewController");
+    for (UIWindow *window in ApolloAllWindows()) {
+        NSMutableArray<UIView *> *queue = [NSMutableArray arrayWithObject:window];
+        for (NSUInteger i = 0; i < queue.count; i++) {
+            UIResponder *next = queue[i].nextResponder;
+            if (threadClass && [next isKindOfClass:threadClass]) {
+                UIViewController *thread = (UIViewController *)next;
+                UIView *bar = thread.inputAccessoryView;
+                UIScrollView *list = ApolloObjectIvar(thread, "messagesCollectionView");
+                ApolloLog(@"[ResponderProbe] thread %@ %p isFirst=%d canBecome=%d bar.window=%@ bar.frame=%@ list.inset=%@ list.frame=%@",
+                          NSStringFromClass(thread.class), thread, thread.isFirstResponder,
+                          thread.canBecomeFirstResponder, NSStringFromClass(bar.window.class),
+                          NSStringFromCGRect([bar convertRect:bar.bounds toView:nil]),
+                          [list isKindOfClass:UIScrollView.class] ? [NSString stringWithFormat:@"%@ content=%@ safe=%@", NSStringFromUIEdgeInsets(list.adjustedContentInset), NSStringFromUIEdgeInsets(list.contentInset), NSStringFromUIEdgeInsets(list.safeAreaInsets)] : @"-",
+                          [list isKindOfClass:UIScrollView.class] ? NSStringFromCGRect([list convertRect:list.bounds toView:nil]) : @"-");
+            }
+            [queue addObjectsFromArray:queue[i].subviews];
+        }
+    }
+}
+
 static void ApolloSimDebugFieldProbe(NSString *tag) {
     UISearchBar *bar = nil;
     for (UIWindow *window in ApolloAllWindows()) {
@@ -1795,6 +1911,55 @@ static void ApolloSimDebugMutateNavigationItem(NSString *columnName) {
               ApolloSimDebugNavigationItemSummary(top.navigationItem));
 }
 
+// "railpad <n>" pads the top controller's trailing items with n dummy icons
+// (0 removes them), so a Duo rail can be pushed into UIKit's overflow without
+// a Live Activity, which the simulator can't show for another app.
+// The rail shows the trailing items of the visible page, which can sit inside
+// a container (the Duo split host): take the first controller that has some.
+static UIViewController *ApolloSimDebugTrailingItemsOwner(UIViewController *controller) {
+    if (!controller.isViewLoaded || !controller.view.window) return nil;
+    for (UIViewController *child in controller.childViewControllers) {
+        UIViewController *owner = ApolloSimDebugTrailingItemsOwner(child);
+        if (owner) return owner;
+    }
+    return controller.navigationItem.rightBarButtonItems.count ? controller : nil;
+}
+
+// "railprobe" logs every bar button view in the window (frame, labels and
+// identifier) and the rail page's trailing items.
+static void ApolloSimDebugProbeRailView(UIView *view) {
+    if ([NSStringFromClass(view.class) isEqualToString:@"_UIButtonBarButton"]) {
+        CGRect frame = [view convertRect:view.bounds toView:nil];
+        ApolloLog(@"[SimDebugTap] railprobe %@ label=%@ id=%@ hidden=%d alpha=%.2f",
+                  NSStringFromCGRect(frame), view.accessibilityLabel, view.accessibilityIdentifier,
+                  view.hidden, view.alpha);
+    }
+    for (UIView *subview in view.subviews) ApolloSimDebugProbeRailView(subview);
+}
+
+static void ApolloSimDebugPadRail(NSInteger count) {
+    UIViewController *top = ApolloSimDebugSelectedNavigationController(@"primary").topViewController;
+    top = ApolloSimDebugTrailingItemsOwner(top) ?: top;
+    UINavigationItem *item = top.navigationItem;
+    NSMutableArray<UIBarButtonItem *> *items = [NSMutableArray array];
+    for (UIBarButtonItem *candidate in item.rightBarButtonItems ?: @[]) {
+        if (![candidate.accessibilityIdentifier isEqualToString:@"ApolloSimRailPad"]) [items addObject:candidate];
+    }
+    for (NSInteger index = 0; index < count; index++) {
+        UIBarButtonItem *pad = [[UIBarButtonItem alloc] initWithImage:[UIImage systemImageNamed:@"circle"]
+                                                                style:UIBarButtonItemStylePlain target:nil action:nil];
+        pad.accessibilityIdentifier = @"ApolloSimRailPad";
+        pad.title = [NSString stringWithFormat:@"Test space %ld", (long)index + 1];
+#if __IPHONE_OS_VERSION_MAX_ALLOWED >= 270000
+        if (@available(iOS 27.0, *)) pad.visibilityPriority = UIBarButtonItemVisibilityPriorityHigh + 1;
+#endif
+        [items insertObject:pad atIndex:0];
+    }
+    [item setRightBarButtonItems:items animated:NO];
+    ApolloLog(@"[SimDebugTap] railpad %ld on %@ (%lu trailing items)", (long)count,
+              NSStringFromClass(top.class), (unsigned long)items.count);
+}
+
 // "navback [primary|detail]" command: perform the navigation-controller pop that UIKit's Back
 // button would request. Xcode 27 currently drops idb HID events, so this keeps
 // compact ownership tests deterministic while still exercising the real stack
@@ -2231,7 +2396,7 @@ static BOOL ApolloSimDebugHandleIntegratedMainCommand(NSString *contents) {
         return YES;
     }
     // "routeblock <route>[,<route>…]" or "routeblock off": make API-Key-Free
-    // routes (www-dotjson, old, api) get Reddit's real block page, to exercise
+    // routes (www-dotjson, old, api, oauth) get Reddit's real block page, to exercise
     // the fallback (ApolloWebJSONRoutes.m).
     if ([contents hasPrefix:@"routeblock "]) {
         NSString *list = [[contents substringFromIndex:11]
@@ -2243,6 +2408,21 @@ static BOOL ApolloSimDebugHandleIntegratedMainCommand(NSString *contents) {
             }
         }
         ApolloWebJSONSimSetBlockedRoutes(mask);
+        return YES;
+    }
+    // "routegate <route>[,<route>…]" or "routegate off": send those routes
+    // with a cookie Reddit doesn't know, so old.reddit.com answers with its
+    // sign-in gate, as it does an account it won't serve.
+    if ([contents hasPrefix:@"routegate "]) {
+        NSString *list = [[contents substringFromIndex:10]
+            stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        NSUInteger mask = 0;
+        for (NSString *name in [list componentsSeparatedByString:@","]) {
+            for (NSInteger r = ApolloWebJSONRouteWww; r <= ApolloWebJSONRouteLast; r++) {
+                if ([ApolloWebJSONRouteName((ApolloWebJSONRoute)r) isEqualToString:name]) mask |= (1u << r);
+            }
+        }
+        ApolloWebJSONSimSetGatedRoutes(mask);
         return YES;
     }
     // "routehealth" logs the API-Key-Free route health; "routehealth reset" clears it.
@@ -2506,6 +2686,23 @@ static void ApolloSimDebugTapNotification(CFNotificationCenterRef center, void *
             }
             return;
         }
+        if ([contents hasPrefix:@"constraintprobe "]) {
+            ApolloSimDebugConstraintProbe([[contents substringFromIndex:16]
+                stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]);
+            return;
+        }
+        if ([contents hasPrefix:@"responderprobe"]) {
+            ApolloSimDebugResponderProbe();
+            return;
+        }
+        if ([contents hasPrefix:@"focusprobe"]) {
+            ApolloSimDebugFocusProbe();
+            return;
+        }
+        if ([contents hasPrefix:@"titleprobe"]) {
+            ApolloSimDebugTitleProbe();
+            return;
+        }
         if ([contents hasPrefix:@"fieldprobe"]) {
             NSString *tag = [[contents substringFromIndex:10] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
             ApolloSimDebugFieldProbe(tag.length ? tag : @"probe");
@@ -2687,6 +2884,49 @@ static void ApolloSimDebugTapNotification(CFNotificationCenterRef center, void *
                 return;
             }
             ApolloSimDebugRunInteractiveTransitionRace([outcome isEqualToString:@"commit"]);
+            return;
+        }
+        if ([contents hasPrefix:@"railprobe"]) {
+            for (UIWindow *window in ApolloAllWindows()) ApolloSimDebugProbeRailView(window);
+            UIViewController *top = ApolloSimDebugSelectedNavigationController(@"primary").topViewController;
+            top = ApolloSimDebugTrailingItemsOwner(top) ?: top;
+            ApolloLog(@"[SimDebugTap] railprobe owner %@ nav=%@ depth=%lu hidesBack=%d leftItems=%lu backItem=%@ stack=%@",
+                      NSStringFromClass(top.class), NSStringFromClass(top.navigationController.class),
+                      (unsigned long)top.navigationController.viewControllers.count, top.navigationItem.hidesBackButton,
+                      (unsigned long)top.navigationItem.leftBarButtonItems.count, top.navigationItem.backBarButtonItem,
+                      [top.navigationController.viewControllers valueForKey:@"class"]);
+            for (UIBarButtonItem *item in top.navigationItem.rightBarButtonItems) {
+                ApolloLog(@"[SimDebugTap] railprobe item on %@: label=%@ id=%@ custom=%@ image=%d",
+                          NSStringFromClass(top.class), item.accessibilityLabel, item.accessibilityIdentifier,
+                          item.customView ? NSStringFromClass(item.customView.class) : @"-", item.image != nil);
+            }
+            return;
+        }
+        if ([contents hasPrefix:@"railmethods"]) {
+            // Every method/ivar on the rail button classes whose name mentions an item.
+            NSMutableString *out = [NSMutableString string];
+            for (NSString *name in @[ @"_UIButtonBarButton", @"_UIModernBarButton" ]) {
+                for (Class cls = objc_getClass(name.UTF8String); cls && cls != UIView.class; cls = class_getSuperclass(cls)) {
+                    unsigned int count = 0;
+                    Method *methods = class_copyMethodList(cls, &count);
+                    for (unsigned int index = 0; index < count; index++) {
+                        NSString *selector = NSStringFromSelector(method_getName(methods[index]));
+                        if ([selector.lowercaseString containsString:@"item"] || [selector.lowercaseString containsString:@"overflow"])
+                            [out appendFormat:@"%s -%@\n", class_getName(cls), selector];
+                    }
+                    free(methods);
+                    Ivar *ivars = class_copyIvarList(cls, &count);
+                    for (unsigned int index = 0; index < count; index++) {
+                        [out appendFormat:@"%s ivar %s %s\n", class_getName(cls), ivar_getName(ivars[index]), ivar_getTypeEncoding(ivars[index]) ?: ""];
+                    }
+                    free(ivars);
+                }
+            }
+            [out writeToFile:@"/tmp/apollofix-railmethods.txt" atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            return;
+        }
+        if ([contents hasPrefix:@"railpad"]) {
+            ApolloSimDebugPadRail([[contents substringFromIndex:@"railpad".length] integerValue]);
             return;
         }
         if ([contents hasPrefix:@"navitemdump"]) {

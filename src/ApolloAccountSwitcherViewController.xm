@@ -190,6 +190,15 @@ static NSArray<ApolloSwitcherAccountRow *> *ApolloSwitcherLoadAccountRows(void) 
     return rows;
 }
 
+// Classic (non-glass) bar buttons inherit the host's system blue; tint the
+// shared bar so +, Edit, back and Save follow the theme accent. Glass keeps
+// UIKit's own glass button styling.
+static void ApolloSwitcherApplyBarAccent(UINavigationBar *bar) {
+    if (!bar || IsLiquidGlass()) return;
+    UIColor *accent = ApolloThemeAccentColor();
+    if (accent) bar.tintColor = accent;
+}
+
 #pragma mark - Per-account credential editor form
 
 // Small standalone form: Reddit API Key / Secret / Redirect URI for one
@@ -229,6 +238,7 @@ static NSArray<ApolloSwitcherAccountRow *> *ApolloSwitcherLoadAccountRows(void) 
     self.navigationController.view.backgroundColor = page;
     self.tableView.separatorColor = ApolloThemeSeparatorColor() ?: UIColor.separatorColor;
     self.view.tintColor = ApolloThemeAccentColor() ?: self.view.tintColor;
+    ApolloSwitcherApplyBarAccent(self.navigationController.navigationBar);
     for (UITableViewCell *cell in self.tableView.visibleCells) {
         cell.backgroundColor = ApolloThemeCardBackgroundColor() ?: UIColor.secondarySystemGroupedBackgroundColor;
     }
@@ -397,6 +407,10 @@ static NSArray<ApolloSwitcherAccountRow *> *ApolloSwitcherLoadAccountRows(void) 
 @property (nonatomic, strong, nullable) UISelectionFeedbackGenerator *accountReorderFeedback;
 @property (nonatomic) BOOL duoEditAccentEnabled;
 @property (nonatomic) BOOL duoEditUpdateScheduled;
+// Whether the last safe-area pass cleared the Duo rail (see
+// ApolloIsAccountSheetContent), and whether a re-push is already queued.
+@property (nonatomic, strong, nullable) NSNumber *duoRailClearedApplied;
+@property (nonatomic) BOOL duoRailRefreshScheduled;
 - (BOOL)driveLiveMoveRowFromIndexPath:(NSIndexPath *)fromPath toIndexPath:(NSIndexPath *)toPath;
 - (void)updateDuoEditButton;
 @end
@@ -684,6 +698,7 @@ static BOOL ApolloAccountReorderSchedulePersist(
     self.navigationController.navigationBar.standardAppearance = appearance;
     self.navigationController.navigationBar.scrollEdgeAppearance = appearance;
     self.navigationController.navigationBar.compactAppearance = appearance;
+    ApolloSwitcherApplyBarAccent(self.navigationController.navigationBar);
 }
 
 + (BOOL)isAvailable {
@@ -734,10 +749,17 @@ static BOOL ApolloAccountReorderSchedulePersist(
     self.tableView.estimatedRowHeight = 0.0;
     self.tableView.estimatedSectionHeaderHeight = 0.0;
     self.tableView.estimatedSectionFooterHeight = 0.0;
-    // Scroll only when the account list exceeds the current sheet detent;
-    // UIKit's grabber owns expansion and interactive dismissal.
-    self.tableView.scrollEnabled = NO;
-    self.tableView.alwaysBounceVertical = NO;
+    if (@available(iOS 15.0, *)) {
+        // The sheet tracks this table (see ApolloInstallAccountSwitcherOverlay):
+        // an upward drag expands it to the large detent, a downward drag at the
+        // top collapses it. That needs a live pan, even when the list fits.
+        self.tableView.alwaysBounceVertical = YES;
+    } else {
+        // iOS 14 keeps Apollo's fitted popup: scroll only when the list
+        // overflows it (viewDidLayoutSubviews), never rubber-band.
+        self.tableView.scrollEnabled = NO;
+        self.tableView.alwaysBounceVertical = NO;
+    }
     self.accountReorderGesture = [[UILongPressGestureRecognizer alloc]
         initWithTarget:self action:@selector(handleAccountReorderGesture:)];
     self.accountReorderGesture.minimumPressDuration = 0.16;
@@ -881,6 +903,7 @@ static BOOL ApolloAccountReorderSchedulePersist(
 
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
+    [self refreshDuoRailSafeAreaIfNeeded];
     if (self.navigationController.topViewController != self) return;
 
     // Folding can change this sheet's accent policy while editing. Keep the
@@ -904,10 +927,49 @@ static BOOL ApolloAccountReorderSchedulePersist(
         self.preferredContentSize = CGSizeMake(self.view.bounds.size.width, height);
         [self.liveManager.presentationController.containerView setNeedsLayout];
     }
-    CGFloat visibleTableHeight = CGRectGetHeight(self.tableView.bounds) -
-        self.tableView.adjustedContentInset.top - self.tableView.adjustedContentInset.bottom;
-    self.tableView.scrollEnabled =
-        self.tableView.contentSize.height > MAX(visibleTableHeight, 0.0) + 0.5;
+    if (@available(iOS 15.0, *)) {
+    } else {
+        CGFloat visibleTableHeight = CGRectGetHeight(self.tableView.bounds) -
+            self.tableView.adjustedContentInset.top - self.tableView.adjustedContentInset.bottom;
+        self.tableView.scrollEnabled =
+            self.tableView.contentSize.height > MAX(visibleTableHeight, 0.0) + 0.5;
+    }
+}
+
+// The account sheet clears the Duo rail from its safe area below the large
+// detent and keeps it at the large detent (ApolloIsAccountSheetContent), but
+// that choice is only made when UIKit pushes safe areas down the tree. A swipe
+// on the list grows the sheet to full height while the selected detent is
+// still medium, so that push clears the rail; the detent turns large only
+// after the swipe, and the unchanged frame never triggers another push. Rows
+// then run under the status column and their ••• opens the system panel.
+// When the choice flips, have UIKit push the safe areas again.
+- (void)refreshDuoRailSafeAreaIfNeeded {
+    UINavigationController *nav = self.navigationController;
+    if (!nav.viewIfLoaded.window) return;
+    BOOL cleared = ApolloIsAccountSheetContent(nav.view);
+    NSNumber *applied = self.duoRailClearedApplied;
+    self.duoRailClearedApplied = @(cleared);
+    if (!applied || applied.boolValue == cleared || self.duoRailRefreshScheduled) return;
+
+    ApolloLog(@"[AccountSwitcher] Duo rail %@ after a detent change, refreshing safe areas",
+              cleared ? @"cleared" : @"kept");
+    // Safe-area writes drive layout, so make them after this pass.
+    self.duoRailRefreshScheduled = YES;
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        typeof(self) owner = weakSelf;
+        owner.duoRailRefreshScheduled = NO;
+        UINavigationController *navigation = owner.navigationController;
+        if (!navigation.viewIfLoaded.window) return;
+        // Changing the extra insets makes UIKit recompute and push this
+        // subtree's safe areas; restoring them leaves the final push exact.
+        UIEdgeInsets extra = navigation.additionalSafeAreaInsets;
+        UIEdgeInsets nudged = extra;
+        nudged.bottom += 1.0;
+        navigation.additionalSafeAreaInsets = nudged;
+        navigation.additionalSafeAreaInsets = extra;
+    });
 }
 
 #pragma mark - UITableViewDataSource
@@ -1137,6 +1199,7 @@ static BOOL ApolloAccountReorderSchedulePersist(
     self.accountReorderFeedback = nil;
     self.accountReorderActive = NO;
     self.accountReorderFinishPending = NO;
+    self.tableView.panGestureRecognizer.enabled = YES;
 }
 
 - (void)evaluateAccountReorderDestination {
@@ -1274,6 +1337,8 @@ static BOOL ApolloAccountReorderSchedulePersist(
             self.accountReorderCornerRadius = cornerRadius;
             self.accountReorderLatestPoint = viewPoint;
             self.accountReorderActive = YES;
+            // Keep a reorder drag from also scrolling or resizing the sheet.
+            self.tableView.panGestureRecognizer.enabled = NO;
             self.accountReorderFeedback = [UISelectionFeedbackGenerator new];
             [self.accountReorderFeedback prepare];
             cell.hidden = YES;
@@ -1636,7 +1701,7 @@ static char kApolloAccountSheetContentKey;
 // propagates the presenting window's rail reservation into the sheet. Scope
 // the correction to this owned navigation subtree, leaving the actual sheet
 // frame and its vertical safe areas under UIKit's control.
-static BOOL ApolloIsAccountSheetContent(UIView *view) {
+BOOL ApolloIsAccountSheetContent(UIView *view) {
     if (ApolloDuoCurrentMode() == ApolloDuoModePhone) return NO;
     for (UIView *ancestor = view; ancestor; ancestor = ancestor.superview) {
         if (objc_getAssociatedObject(ancestor, &kApolloAccountSheetContentKey)) {
@@ -1700,6 +1765,12 @@ static void ApolloInstallAccountSwitcherOverlay(UIViewController *host) {
         overlayNav.modalPresentationStyle = UIModalPresentationCurrentContext;
 
         [host addChildViewController:overlayNav];
+        if (@available(iOS 15.0, *)) {
+            // The sheet turns drags on the presented controller's content
+            // scroll view into detent changes. Name the visible list, not
+            // whatever UIKit's lookup finds (possibly Apollo's hidden table).
+            [host setContentScrollView:switcher.tableView forEdge:NSDirectionalRectEdgeAll];
+        }
         objc_setAssociatedObject(overlayNav.view, &kApolloAccountSheetContentKey, @YES,
                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         overlayNav.view.frame = host.view.bounds;
@@ -1739,26 +1810,9 @@ static void ApolloQuarantineAccountSwitcher(UIViewController *controller) {
     });
 }
 
-// Keep Apollo's initialized account manager and its live account callbacks,
-// but let UIKit own the sheet's geometry, animation and interactive dismissal.
-// Configure at presentation time, after Apollo's Swift initializer has chosen
-// its custom presentation style and before UIKit creates a presentation owner.
 %hook UIViewController
 - (void)presentViewController:(UIViewController *)controller animated:(BOOL)animated
                   completion:(void (^)(void))completion {
-    if (@available(iOS 15.0, *)) {
-        if ([ApolloAccountSwitcherViewController isAvailable] &&
-            [NSStringFromClass(controller.class) isEqualToString:@"Apollo.AccountManagerViewController"]) {
-            controller.transitioningDelegate = nil;
-            controller.modalPresentationStyle = UIModalPresentationFormSheet;
-            controller.preferredContentSize = CGSizeMake(540.0, 380.0);
-            UISheetPresentationController *sheet = controller.sheetPresentationController;
-            sheet.detents = @[UISheetPresentationControllerDetent.mediumDetent,
-                              UISheetPresentationControllerDetent.largeDetent];
-            sheet.prefersGrabberVisible = YES;
-            sheet.prefersScrollingExpandsWhenScrolledToEdge = YES;
-        }
-    }
     // Holding the Account tab invokes its native action without selecting it.
     // After unfolding (or before Account's first visit), that action's navigation
     // controller is offscreen. Present the same initialized manager from the
@@ -1775,7 +1829,45 @@ static void ApolloQuarantineAccountSwitcher(UIViewController *controller) {
 }
 %end
 
+// Keep Apollo's initialized account manager and its live account callbacks,
+// but let UIKit own the sheet's geometry, animation and interactive dismissal.
+// Answer UIKit's presentation-time reads here rather than configuring from a
+// -presentViewController: hook: in a post Apollo presents from
+// CommentsViewController, whose own presentViewController: hook calls the
+// unhooked UIKit implementation, so a UIViewController-level hook never runs.
+static BOOL ApolloAccountSwitcherUsesNativeSheet(void) {
+    if (@available(iOS 15.0, *)) return [ApolloAccountSwitcherViewController isAvailable];
+    return NO;
+}
+
 %hook _TtC6Apollo28AccountManagerViewController
+
+- (UIModalPresentationStyle)modalPresentationStyle {
+    return ApolloAccountSwitcherUsesNativeSheet() ? UIModalPresentationFormSheet : %orig;
+}
+
+- (id)transitioningDelegate {
+    return ApolloAccountSwitcherUsesNativeSheet() ? nil : %orig;
+}
+
+- (CGSize)preferredContentSize {
+    return ApolloAccountSwitcherUsesNativeSheet() ? CGSizeMake(540.0, 380.0) : %orig;
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    %orig;
+    // Apollo keeps this instance, and every presentation gets a new sheet.
+    if (@available(iOS 15.0, *)) {
+        UIViewController *controller = (UIViewController *)self;
+        if (ApolloAccountSwitcherUsesNativeSheet() && controller.isBeingPresented) {
+            UISheetPresentationController *sheet = controller.sheetPresentationController;
+            sheet.detents = @[UISheetPresentationControllerDetent.mediumDetent,
+                              UISheetPresentationControllerDetent.largeDetent];
+            sheet.prefersGrabberVisible = YES;
+            sheet.prefersScrollingExpandsWhenScrolledToEdge = YES;
+        }
+    }
+}
 
 - (void)viewDidLoad {
     %orig;

@@ -3235,8 +3235,11 @@ static void ApolloImgurRetryAlbumViaTextProxy(NSString *albumID,
 - (void)_onqueue_didFinishWithError:(id)error {
     if (sWebJSONEnabled) {
         NSURLSessionTask *task = (NSURLSessionTask *)self;
-        NSURLRequest *finished = task.currentRequest ?: task.originalRequest;
-        ApolloWebJSONNoteResponse(finished, task.response);
+        // The request as sent (the rewrite above installs it as both). After a
+        // redirect, such as Old Reddit's sign-in gate, the current request is
+        // the redirect target, whose path isn't the read's.
+        NSURLRequest *sent = task.originalRequest ?: task.currentRequest;
+        ApolloWebJSONNoteResponse(sent, task.response);
     }
     %orig;
 }
@@ -3673,7 +3676,7 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
                                     UDKeyEnableFlairColors: @NO,
                                     UDKeyBoldPostTitles: @NO,
                                     UDKeyFeedTextPostThumbnails: @YES,
-                                    UDKeyRestoreReadingSession: @YES,
+                                    UDKeyRestoreReadingSession: @NO,
                                     UDKeyFeedGalleryCarousel: @YES,
                                     UDKeyFeedGalleryEdgeSwipeNav: @NO,
                                     UDKeyGalleryAutoplayVideos: @YES,
@@ -3747,6 +3750,7 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
                                     UDKeyTabBarSwipeNavigation: @NO,
                                     UDKeyDuoLandscapeFeedLayout: @0,
                                     UDKeyDuoSubredditPanelGlassEnabled: @NO,
+                                    UDKeySubredditSwitcherSheetEnabled: @(ApolloDeviceIsDuo()),
                                     UDKeyIPadPaneLayout: @NO,
                                     UDKeyLiquidGlassEnabled: @YES,
                                     UDKeyIconRowMagnifier: @YES,
@@ -3760,6 +3764,7 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
                                     UDKeyInfoRowTapTranslation: @YES,
                                     UDKeyThreeStateVoting: @NO,
                                     UDKeyLiveCommentsFollow: @YES,
+                                    UDKeyCommentNavigationMode: @0,
                                     UDKeyPerPostCommentSort: @NO,
                                     UDKeyEnableBulkTranslation: @NO,
                                     UDKeyAutoTranslateOnAppear: @YES,
@@ -3809,6 +3814,8 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
                                     UDKeyReduceRateLimiting: @NO,
                                     UDKeyKeylessRouteUpdates: @YES,
                                     UDKeyReduceRateLimitingOffered: @NO,
+                                    UDKeyAllPlusNSFWEnabled: @NO,
+                                    UDKeyAllPlusNSFWBoost: @0.0,
                                     UDKeyUseModernRedditChat: @NO,
                                     UDKeyUseModernRedditModmail: @NO,
                                     UDKeyNotificationBackendURL: @"",
@@ -3869,6 +3876,9 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
     sImgurAlbumFallbackProxies = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyImgurAlbumFallbackProxies];
     sEnableInlineImages = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyEnableInlineImages];
     sEnableChatMedia = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyEnableChatMedia];
+    sAllPlusNSFWEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyAllPlusNSFWEnabled];
+    double apBoost = [[NSUserDefaults standardUserDefaults] doubleForKey:UDKeyAllPlusNSFWBoost];
+    sAllPlusNSFWBoost = fmax(0.0, fmin(2.0, apBoost));   // clamp to the slider range
     sEnableAISummaries = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyEnableAISummaries];
     sEnableAIPostSummaries = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyEnableAIPostSummaries];
     sEnableAICommentSummaries = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyEnableAICommentSummaries];
@@ -4066,6 +4076,7 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
     sTabBarSwipeNavigation = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyTabBarSwipeNavigation];
     sDuoLandscapeFeedLayout = [standardDefaults integerForKey:UDKeyDuoLandscapeFeedLayout];
     sDuoSubredditPanelGlassEnabled = [standardDefaults boolForKey:UDKeyDuoSubredditPanelGlassEnabled];
+    sSubredditSwitcherSheetEnabled = [standardDefaults boolForKey:UDKeySubredditSwitcherSheetEnabled];
     // Value 1 belonged to the removed side-by-side experiment. Keep Focused
     // feed at 2 so existing selections survive this menu cleanup.
     if (sDuoLandscapeFeedLayout != 0 && sDuoLandscapeFeedLayout != 2) {
@@ -4088,6 +4099,7 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
     sInfoRowTapTranslation = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyInfoRowTapTranslation];
     sThreeStateVoting = [standardDefaults boolForKey:UDKeyThreeStateVoting];
     sLiveCommentsFollow = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyLiveCommentsFollow];
+    sCommentNavigationMode = [[NSUserDefaults standardUserDefaults] integerForKey:UDKeyCommentNavigationMode] == 1 ? 1 : 0;
     sPerPostCommentSort = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyPerPostCommentSort];
     // Both sort memories on = stale state from an older build or a restored backup;
     // they are mutually exclusive (see ApolloPerPostCommentSort.xm) and per-post wins.
